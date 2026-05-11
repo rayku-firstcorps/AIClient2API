@@ -2417,6 +2417,19 @@ async saveCredentialsToFile(filePath, newData) {
                         }
                     });
                 }
+                // 处理 Kiro API 在流内返回的错误事件
+                else if (parsed.error || parsed.type === 'error' || parsed.errorCode || parsed.errorMessage) {
+                    const errMsg = parsed.error || parsed.message || parsed.errorMessage || JSON.stringify(parsed);
+                    logger.warn(`[Kiro] Error event received in stream: ${errMsg}`);
+                    events.push({ type: 'streamError', data: parsed });
+                }
+                // 记录未识别的事件（用于诊断断流）
+                else {
+                    const keys = Object.keys(parsed).join(',');
+                    if (keys && keys !== 'followupPrompt') {
+                        logger.debug(`[Kiro] Unrecognized stream event (keys: ${keys}): ${JSON.stringify(parsed).substring(0, 200)}`);
+                    }
+                }
             } catch (e) {
                 // JSON 解析失败，跳过这个 "{" 继续搜索，避免二进制头部中的偶然字符阻塞后续 payload
                 searchStart = jsonStart + 1;
@@ -2493,10 +2506,18 @@ async saveCredentialsToFile(filePath, newData) {
             }
             let buffer = '';
             let lastContentEvent = null;  // 用于检测连续重复的 content 事件
+            let yieldedEventCount = 0;
+            let rawStreamSample = '';  // 保存原始流数据样本用于诊断空响应
 
             for await (const chunk of stream) {
-                buffer += chunk.toString();
-                
+                const chunkStr = chunk.toString();
+                buffer += chunkStr;
+
+                // 保存前 2000 字符的原始流数据用于诊断
+                if (rawStreamSample.length < 2000) {
+                    rawStreamSample += chunkStr.substring(0, 2000 - rawStreamSample.length);
+                }
+
                 // 解析缓冲区中的事件
                 const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
                 buffer = remaining;
@@ -2510,21 +2531,42 @@ async saveCredentialsToFile(filePath, newData) {
                             continue;
                         }
                         lastContentEvent = event.data;
+                        yieldedEventCount++;
                         yield { type: 'content', content: event.data };
                     } else if (event.type === 'toolUse') {
                         const toolUse = {
                             ...event.data,
                             name: toolNameMaps?.fromKiroName ? toolNameMaps.fromKiroName(event.data?.name) : event.data?.name
                         };
+                        yieldedEventCount++;
                         yield { type: 'toolUse', toolUse };
                     } else if (event.type === 'toolUseInput') {
+                        yieldedEventCount++;
                         yield { type: 'toolUseInput', input: event.data.input };
                     } else if (event.type === 'toolUseStop') {
+                        yieldedEventCount++;
                         yield { type: 'toolUseStop', stop: event.data.stop };
+                    } else if (event.type === 'streamError') {
+                        const errData = event.data;
+                        const errMsg = errData.error || errData.message || errData.errorMessage || JSON.stringify(errData);
+                        logger.error(`[Kiro] Stream returned error event: ${errMsg}`);
+                        const streamErr = new Error(`Kiro stream error: ${errMsg}`);
+                        streamErr.isStreamError = true;
+                        streamErr.streamErrorData = errData;
+                        throw streamErr;
                     } else if (event.type === 'contextUsage') {
+                        yieldedEventCount++;
                         yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage };
                     }
                 }
+            }
+
+            // 流正常结束但没有产生任何有效事件 — 视为空响应，触发重试
+            if (yieldedEventCount === 0) {
+                logger.warn(`[Kiro] Stream ended with zero events yielded. Raw stream sample (first 500 chars): ${rawStreamSample.substring(0, 500)}`);
+                const emptyErr = new Error('Kiro stream ended with no content (empty response)');
+                emptyErr.isStreamError = true;
+                throw emptyErr;
             }
         } catch (error) {
             // 确保出错时关闭流
@@ -2590,6 +2632,15 @@ async saveCredentialsToFile(filePath, newData) {
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
                 throw error;
+            }
+
+            // Handle in-stream error events from Kiro API (e.g., throttling, internal errors)
+            if (error.isStreamError && retryCount < maxRetries) {
+                const delay = baseDelay * Math.pow(2, retryCount);
+                logger.info(`[Kiro] Stream error event received. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
+                return;
             }
 
             // Handle network errors (ECONNRESET, ETIMEDOUT, etc.) with exponential backoff
