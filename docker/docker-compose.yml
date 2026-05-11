@@ -1,8 +1,12 @@
 services:
   aiclient-api:
-    # 方式一：使用 Docker Hub 预构建镜像（默认，推荐）
-    # 使用方法: docker compose up -d
-    image: justlikemaki/aiclient-2-api:latest
+    # Default deployment: build the image from this repository.
+    # Usage from this directory: docker compose up -d --build
+    # Usage from repository root: docker compose -f docker/docker-compose.yml up -d --build
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: aiclient2api:local
     container_name: aiclient2api
     restart: unless-stopped
     ports:
@@ -11,7 +15,7 @@ services:
       - "1455:1455"
       - "19876-19880:19876-19880"
     volumes:
-      - ./configs:/app/configs
+      - ../configs:/app/configs
     environment:
       - ARGS=
     healthcheck:

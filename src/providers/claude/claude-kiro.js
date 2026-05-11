@@ -218,6 +218,274 @@ const MODEL_MAPPING = Object.fromEntries(
 );
 
 const KIRO_AUTH_TOKEN_FILE = "kiro-auth-token.json";
+const KIRO_PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
+const KIRO_PROMPT_CACHE_EXTENDED_TTL_MS = 60 * 60 * 1000;
+const KIRO_PROMPT_CACHE_TOOL_DESCRIPTION_MAX_LENGTH = 9216;
+const kiroPromptCache = new Map();
+
+function sortJsonValue(value) {
+    if (Array.isArray(value)) {
+        return value.map(sortJsonValue);
+    }
+    if (value && typeof value === 'object') {
+        return Object.keys(value).sort().reduce((acc, key) => {
+            acc[key] = sortJsonValue(value[key]);
+            return acc;
+        }, {});
+    }
+    return value;
+}
+
+function stableJsonStringify(value) {
+    return JSON.stringify(sortJsonValue(value));
+}
+
+function omitKiroCacheMetadata(value) {
+    if (Array.isArray(value)) {
+        return value.map(omitKiroCacheMetadata);
+    }
+    if (value && typeof value === 'object') {
+        return Object.keys(value).sort().reduce((acc, key) => {
+            if (key === 'cache_control') return acc;
+            acc[key] = omitKiroCacheMetadata(value[key]);
+            return acc;
+        }, {});
+    }
+    return value;
+}
+
+function parseKiroCacheTtlMs(cacheControl) {
+    return cacheControl?.ttl === '1h'
+        ? KIRO_PROMPT_CACHE_EXTENDED_TTL_MS
+        : KIRO_PROMPT_CACHE_DEFAULT_TTL_MS;
+}
+
+function normalizeToolForKiroPromptCache(tool = {}) {
+    const rawName = String(tool.name || '');
+    const lowerName = rawName.toLowerCase();
+    if (lowerName === 'web_search' || lowerName === 'websearch') {
+        return null;
+    }
+
+    let description = String(tool.description || '');
+    if (!description.trim()) {
+        return null;
+    }
+    if (description.length > KIRO_PROMPT_CACHE_TOOL_DESCRIPTION_MAX_LENGTH) {
+        description = description.substring(0, KIRO_PROMPT_CACHE_TOOL_DESCRIPTION_MAX_LENGTH) + "...";
+    }
+
+    const schema = omitKiroCacheMetadata(tool.input_schema || {});
+    const parts = [`name:${shortenKiroToolName(rawName)}`];
+    parts.push(`desc:${description}`);
+    if (schema && Object.keys(schema).length > 0) {
+        parts.push(`schema:${stableJsonStringify(schema)}`);
+    }
+
+    return parts.join('|');
+}
+
+function normalizeMessageBlockForKiroPromptCache(block = {}) {
+    return stableJsonStringify(omitKiroCacheMetadata(block || {}));
+}
+
+function appendHash(hasher, value) {
+    hasher.update(String(value || ''), 'utf8');
+}
+
+function currentHashHex(hasher) {
+    return hasher.copy().digest('hex');
+}
+
+function getKiroSystemBlocks(system) {
+    if (!system) return [];
+    if (typeof system === 'string') {
+        return [{ text: system }];
+    }
+    if (Array.isArray(system)) {
+        return system.map(item => {
+            if (typeof item === 'string') return { text: item };
+            return item || {};
+        });
+    }
+    if (typeof system === 'object') {
+        return [system];
+    }
+    return [{ text: String(system) }];
+}
+
+function normalizeSystemTextForKiroPromptCache(text) {
+    const rawText = String(text || '');
+    if (/^\s*x-anthropic-billing-header\s*:/i.test(rawText)) {
+        return '';
+    }
+    return rawText;
+}
+
+function computeKiroPromptCacheBreakpoints(requestBody, countTextTokens) {
+    const hasher = crypto.createHash('sha256');
+    const breakpoints = [];
+    let cumulativeTokens = 0;
+
+    const tools = Array.isArray(requestBody?.tools) ? [...requestBody.tools] : [];
+    tools.sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
+    for (const tool of tools) {
+        const normalized = normalizeToolForKiroPromptCache(tool);
+        if (!normalized) continue;
+        appendHash(hasher, normalized);
+        cumulativeTokens += countTextTokens(normalized);
+        if (tool?.cache_control) {
+            breakpoints.push({
+                hash: currentHashHex(hasher),
+                tokens: cumulativeTokens,
+                ttlMs: parseKiroCacheTtlMs(tool.cache_control),
+                label: `tool:${tool.name || ''}`
+            });
+        }
+    }
+
+    for (const block of getKiroSystemBlocks(requestBody?.system)) {
+        const text = normalizeSystemTextForKiroPromptCache(block?.text || '');
+        if (text) {
+            appendHash(hasher, text);
+            cumulativeTokens += countTextTokens(text);
+        }
+        if (block?.cache_control) {
+            breakpoints.push({
+                hash: currentHashHex(hasher),
+                tokens: cumulativeTokens,
+                ttlMs: parseKiroCacheTtlMs(block.cache_control),
+                label: 'system'
+            });
+        }
+    }
+
+    const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+    for (const message of messages) {
+        if (Array.isArray(message?.content)) {
+            for (const block of message.content) {
+                appendHash(hasher, normalizeMessageBlockForKiroPromptCache(block));
+                if (block?.type === 'text' && typeof block.text === 'string') {
+                    cumulativeTokens += countTextTokens(block.text);
+                }
+                if (block?.cache_control) {
+                    breakpoints.push({
+                        hash: currentHashHex(hasher),
+                        tokens: cumulativeTokens,
+                        ttlMs: parseKiroCacheTtlMs(block.cache_control),
+                        label: `message:${message.role || 'unknown'}:${block.type || 'block'}`
+                    });
+                }
+            }
+        } else if (typeof message?.content === 'string') {
+            appendHash(hasher, message.content);
+            cumulativeTokens += countTextTokens(message.content);
+        }
+    }
+
+    return breakpoints;
+}
+
+function getKiroPromptCacheScope(config = {}, service = {}) {
+    return [
+        config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API,
+        service.uuid || config.uuid || service.profileArn || service.clientId || 'default'
+    ].join(':');
+}
+
+function getKiroPromptCacheEntry(key) {
+    const entry = kiroPromptCache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+        kiroPromptCache.delete(key);
+        return null;
+    }
+    return entry;
+}
+
+function setKiroPromptCacheEntry(key, tokens, ttlMs) {
+    kiroPromptCache.set(key, {
+        tokens,
+        expiresAt: Date.now() + ttlMs
+    });
+}
+
+function lookupOrCreateKiroPromptCache(scope, breakpoints, totalInputTokens) {
+    const result = {
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        uncached_input_tokens: totalInputTokens
+    };
+
+    if (!breakpoints.length) {
+        return result;
+    }
+
+    for (let i = breakpoints.length - 1; i >= 0; i--) {
+        const bp = breakpoints[i];
+        const key = `cache:${scope}:${bp.hash}`;
+        const entry = getKiroPromptCacheEntry(key);
+        if (!entry) continue;
+
+        result.cache_read_input_tokens = entry.tokens;
+        setKiroPromptCacheEntry(key, entry.tokens, bp.ttlMs);
+
+        let prevTokens = entry.tokens;
+        for (const laterBp of breakpoints.slice(i + 1)) {
+            const laterKey = `cache:${scope}:${laterBp.hash}`;
+            setKiroPromptCacheEntry(laterKey, laterBp.tokens, laterBp.ttlMs);
+            result.cache_creation_input_tokens += Math.max(0, laterBp.tokens - prevTokens);
+            prevTokens = laterBp.tokens;
+        }
+
+        const cachedTokens = result.cache_read_input_tokens + result.cache_creation_input_tokens;
+        result.uncached_input_tokens = Math.max(0, totalInputTokens - cachedTokens);
+        return result;
+    }
+
+    let prevTokens = 0;
+    for (const bp of breakpoints) {
+        const key = `cache:${scope}:${bp.hash}`;
+        setKiroPromptCacheEntry(key, bp.tokens, bp.ttlMs);
+        result.cache_creation_input_tokens += Math.max(0, bp.tokens - prevTokens);
+        prevTokens = bp.tokens;
+    }
+
+    const cachedTokens = result.cache_read_input_tokens + result.cache_creation_input_tokens;
+    result.uncached_input_tokens = Math.max(0, totalInputTokens - cachedTokens);
+    return result;
+}
+
+function calculateKiroPromptCacheUsage(requestBody, countTextTokens, totalInputTokens, scope) {
+    const breakpoints = computeKiroPromptCacheBreakpoints(requestBody, countTextTokens);
+    const result = lookupOrCreateKiroPromptCache(scope, breakpoints, totalInputTokens);
+    if (breakpoints.length > 0) {
+        logger.info(
+            `[Kiro Prompt Cache] breakpoints=${breakpoints.length}, read=${result.cache_read_input_tokens}, ` +
+            `creation=${result.cache_creation_input_tokens}, uncached=${result.uncached_input_tokens}`
+        );
+        logger.info(
+            `[Kiro Prompt Cache] breakpoint details: ` +
+            breakpoints.map((bp, index) => `${index + 1}:${bp.label || 'unknown'}:${bp.tokens}:${bp.hash.slice(0, 12)}`).join(', ')
+        );
+    }
+    return result;
+}
+
+function adjustKiroPromptCacheUsageTotal(cacheUsage, totalInputTokens) {
+    if (!cacheUsage) {
+        return {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            uncached_input_tokens: totalInputTokens
+        };
+    }
+    const cachedTokens = (cacheUsage.cache_read_input_tokens || 0) + (cacheUsage.cache_creation_input_tokens || 0);
+    return {
+        ...cacheUsage,
+        uncached_input_tokens: Math.max(0, totalInputTokens - cachedTokens)
+    };
+}
 
 /**
  * Kiro API Service - Node.js implementation based on the Python ki2api
@@ -2066,7 +2334,13 @@ async saveCredentialsToFile(filePath, newData) {
         logger.info(`[Kiro] Calling generateContent with model: ${finalModel}`);
         
         // Estimate input tokens before making the API call
-        const inputTokens = this.estimateInputTokens(requestBody);
+        const estimatedInputTokens = this.estimateInputTokens(requestBody);
+        const promptCacheUsage = calculateKiroPromptCacheUsage(
+            requestBody,
+            text => this.countTextTokens(text),
+            estimatedInputTokens,
+            getKiroPromptCacheScope(this.config, this)
+        );
         
         const response = await this.callApi('', finalModel, requestBody);
 
@@ -2078,7 +2352,7 @@ async saveCredentialsToFile(filePath, newData) {
             const contentForClaude = thinkingRequested
                 ? this._toClaudeContentBlocksFromKiroText(responseText)
                 : responseText;
-            return this.buildClaudeResponse(contentForClaude, false, 'assistant', model, toolCalls, inputTokens);
+            return this.buildClaudeResponse(contentForClaude, false, 'assistant', model, toolCalls, estimatedInputTokens, promptCacheUsage);
         } catch (error) {
             logger.error('[Kiro] Error in generateContent:', error);
             throw error;
@@ -2519,6 +2793,12 @@ async saveCredentialsToFile(filePath, newData) {
             const toolUseBlockIndexes = new Map(); // toolUseId -> content block index
 
             const estimatedInputTokens = this.estimateInputTokens(requestBody);
+            const estimatedPromptCacheUsage = calculateKiroPromptCacheUsage(
+                requestBody,
+                text => this.countTextTokens(text),
+                estimatedInputTokens,
+                getKiroPromptCacheScope(this.config, this)
+            );
 
             // 1. 先发送 message_start 事件
             yield {
@@ -2531,8 +2811,8 @@ async saveCredentialsToFile(filePath, newData) {
                     usage: {
                         input_tokens: estimatedInputTokens,
                         output_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0
+                        cache_creation_input_tokens: estimatedPromptCacheUsage.cache_creation_input_tokens,
+                        cache_read_input_tokens: estimatedPromptCacheUsage.cache_read_input_tokens
                     },
                     content: []
                 }
@@ -2909,14 +3189,16 @@ async saveCredentialsToFile(filePath, newData) {
             }
 
             // 4. 发送 message_delta 事件
+            const promptCacheUsage = adjustKiroPromptCacheUsageTotal(estimatedPromptCacheUsage, inputTokens);
+
             yield {
                 type: "message_delta",
                 delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : (emittedOnlyThinking ? "max_tokens" : "end_turn") },
                 usage: {
                     input_tokens: inputTokens,
                     output_tokens: outputTokens,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0
+                    cache_creation_input_tokens: promptCacheUsage.cache_creation_input_tokens,
+                    cache_read_input_tokens: promptCacheUsage.cache_read_input_tokens
                 }
             };
 
@@ -2946,8 +3228,13 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * Build Claude compatible response object
      */
-    buildClaudeResponse(content, isStream = false, role = 'assistant', model, toolCalls = null, inputTokens = 0) {
+    buildClaudeResponse(content, isStream = false, role = 'assistant', model, toolCalls = null, inputTokens = 0, promptCacheUsage = null) {
         const messageId = `${uuidv4()}`;
+        const cacheUsage = promptCacheUsage || {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            uncached_input_tokens: inputTokens
+        };
 
         if (isStream) {
             // Kiro API is "pseudo-streaming", so we'll send a few events to simulate
@@ -2964,7 +3251,9 @@ async saveCredentialsToFile(filePath, newData) {
                     model: model,
                     usage: {
                         input_tokens: inputTokens,
-                        output_tokens: 0 // Will be updated in message_delta
+                        output_tokens: 0, // Will be updated in message_delta
+                        cache_creation_input_tokens: cacheUsage.cache_creation_input_tokens,
+                        cache_read_input_tokens: cacheUsage.cache_read_input_tokens
                     },
                     content: [] // Content will be streamed via content_block_delta
                 }
@@ -3061,7 +3350,11 @@ async saveCredentialsToFile(filePath, newData) {
                     stop_reason: stopReason,
                     stop_sequence: null,
                 },
-                usage: { output_tokens: totalOutputTokens }
+                usage: {
+                    output_tokens: totalOutputTokens,
+                    cache_creation_input_tokens: cacheUsage.cache_creation_input_tokens,
+                    cache_read_input_tokens: cacheUsage.cache_read_input_tokens
+                }
             });
 
             // 6. message_stop event
@@ -3143,7 +3436,9 @@ async saveCredentialsToFile(filePath, newData) {
                 stop_sequence: null,
                 usage: {
                     input_tokens: inputTokens,
-                    output_tokens: outputTokens
+                    output_tokens: outputTokens,
+                    cache_creation_input_tokens: cacheUsage.cache_creation_input_tokens,
+                    cache_read_input_tokens: cacheUsage.cache_read_input_tokens
                 },
                 content: contentArray
             };
