@@ -646,6 +646,32 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
 
+    // SSE 心跳保活：防止长时间思考（opus-4-7）期间客户端因 idle timeout 断开
+    const KEEPALIVE_INTERVAL_MS = 15000;
+    let keepaliveTimer = null;
+    const startKeepalive = () => {
+        if (keepaliveTimer) return;
+        keepaliveTimer = setInterval(() => {
+            if (!clientDisconnected.value && !res.writableEnded) {
+                try {
+                    res.write(': keepalive\n\n');
+                } catch (e) {
+                    clearInterval(keepaliveTimer);
+                    keepaliveTimer = null;
+                }
+            } else {
+                clearInterval(keepaliveTimer);
+                keepaliveTimer = null;
+            }
+        }, KEEPALIVE_INTERVAL_MS);
+    };
+    const stopKeepalive = () => {
+        if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+        }
+    };
+
     try {
         // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
         // The service returns a stream in its native format (toProvider).
@@ -655,6 +681,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态
         const streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+        startKeepalive();
 
         for await (const nativeChunk of nativeStream) {
             // 检查客户端是否已断开连接
@@ -778,6 +806,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             }
         }
 
+        stopKeepalive();
+
         // 流式请求成功完成，统计使用次数，错误次数重置为0
         if (providerPoolManager && pooluuid) {
             const customNameDisplay = customName ? `, ${customName}` : '';
@@ -788,6 +818,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
     }  catch (error) {
+        stopKeepalive();
         logger.error('\n[Server] Error during stream processing:', error.stack);
         
         // 如果客户端已断开，不需要发送错误响应
@@ -935,10 +966,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             if (!res.writableEnded) {
                 try {
                     if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI) {
-                        if (!hasMessageStop) {
-                            res.write('data: [DONE]\n\n');
-                            hasMessageStop = true;
-                        }
+                        // OpenAI Chat Completions streaming expects a terminal [DONE] marker.
+                        // finish_reason chunks are not a replacement for [DONE].
+                        res.write('data: [DONE]\n\n');
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
                         // OpenAI Responses 以 response.completed/response.incomplete（或 error）作为结束事件。
                         // 连接关闭即表示流结束；不要再追加 `event: done` + `data: {}`，否则会触发下游类型校验失败（AI_TypeValidationError）。
