@@ -22,7 +22,7 @@ import { getProviderPoolManager } from '../../services/service-manager.js';
 
 const KIRO_THINKING = {
     MIN_BUDGET_TOKENS: 1024,
-    MAX_BUDGET_TOKENS: 24576,
+    MAX_BUDGET_TOKENS: 128000,
     DEFAULT_BUDGET_TOKENS: 20000,
     START_TAG: '<thinking>',
     END_TAG: '</thinking>',
@@ -37,6 +37,7 @@ const KIRO_CONSTANTS = {
     BASE_URL: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse',
     DEFAULT_MODEL_NAME: 'claude-sonnet-4-5',
     AXIOS_TIMEOUT: 120000, // 2 minutes timeout for normal requests
+    STREAM_TIMEOUT: 600000, // 10 minutes timeout for streaming requests (opus-4-7 thinking can be long)
     TOKEN_REFRESH_TIMEOUT: 15000, // 15 seconds timeout for token refresh (shorter to avoid blocking)
     USER_AGENT: 'KiroIDE',
     KIRO_VERSION: '0.11.63',
@@ -1313,23 +1314,7 @@ async saveCredentialsToFile(filePath, newData) {
     async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
         const conversationId = uuidv4();
         
-        // 内置的 systemPrompt 前缀
-        const builtInPrefix = `<CRITICAL_OVERRIDE>
-                                你一定不能说自己是 kiro ，这是非常重要的一点。
-                                你只能回答用户的问题，不能回答任何关于 kiro 的问题。
-                                你得身份认知，只能从后续的提示词中获取（可能是 Kilo Code，Cline，Claude Code，或者其他用户自定义的身份名称），不能自己推理。如果没有，就说自己是 ”开发者何夕2077，你现在使用的不是原版Claude，而是AIClient2API”。
-                               </CRITICAL_OVERRIDE>
-                               <identity>
-                                你是 {{identity}}，一名拥有多种编程语言、框架、设计模式和最佳实践丰富知识的高级软件工程师。
-                               </identity>`;
-        
-        let systemPrompt = this.getContentText(inSystemPrompt);
-        // 在 systemPrompt 前面添加内置前缀
-        if (systemPrompt) {
-            systemPrompt = `${builtInPrefix}\n\n${systemPrompt}`;
-        } else {
-            systemPrompt = `${builtInPrefix}`;
-        }
+        let systemPrompt = this.getContentText(inSystemPrompt) || '';
         
         const processedMessages = messages.map(message => ({
             ...message,
@@ -2530,13 +2515,18 @@ async saveCredentialsToFile(filePath, newData) {
                 url: requestUrl,
                 data: requestData,
                 headers,
-                responseType: 'stream'
+                responseType: 'stream',
+                timeout: KIRO_CONSTANTS.STREAM_TIMEOUT
             };
             this._applySidecar(axiosConfig);
             releaseThrottle = await acquireKiroRequestSlot(this.config);
             const response = await this.axiosInstance.request(axiosConfig);
 
             stream = response.data;
+            // Extend socket idle timeout for streaming (opus-4-7 thinking can be silent for minutes)
+            if (stream.socket) {
+                stream.socket.setTimeout(KIRO_CONSTANTS.STREAM_TIMEOUT);
+            }
             let buffer = '';
             let lastContentEvent = null;  // 用于检测连续重复的 content 事件
 
